@@ -11,6 +11,12 @@ _FUSED_QK_NORM_ROPE_3D = None
 _RMSNORM = None
 
 
+from xvideo.models.dit import ail_ops as _ail_ops
+
+if torch.cuda.is_available():
+    _ail_ops.norm_module()
+
+
 def available() -> bool:
     return _try_import()
 
@@ -45,6 +51,11 @@ def fused_layernorm_modulate(
         scale = scale.unsqueeze(1)
         shift = shift.unsqueeze(1)
     if scale.shape[1] == 1 and L != 1:
+        # ai-livestream: broadcast kernel (same math) instead of materializing [B*L, D] scale/shift copies
+        out = _ail_ops.fused_norm_scale_shift_bcast(
+            x_2d, weight, bias, scale.reshape(B, D).contiguous(), shift.reshape(B, D).contiguous(), "layer", eps, L)
+        if out is not None:
+            return out.reshape(B, L, D)
         scale = scale.expand(B, L, D)
         shift = shift.expand(B, L, D)
     scale_2d = scale.reshape(-1, D).contiguous()
