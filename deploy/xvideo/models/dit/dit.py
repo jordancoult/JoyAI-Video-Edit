@@ -92,6 +92,10 @@ def _maybe_install_fp8_stream(block, stream: str) -> None:
     _approx = getattr(gelu_mod, "approximate", "tanh") if gelu_mod is not None else "tanh"
     setattr(block, f"_{stream}_mlp_act",
             lambda x, _a=_approx: torch.nn.functional.gelu(x, approximate=_a))
+    # ai-livestream: GELU fused into the FP8 activation quant of mlp down (bit-identical; fast-accum path only)
+    from xvideo.models.dit import fp8_linear as _fp8l
+    setattr(block, f"_{stream}_mlp_gelu_fused",
+            _approx == "tanh" and _fp8l._FAST_ACCUM and os.environ.get("JOYOMNI_AIL_OPS", "1") != "0")
     # Biases stay (the Fp8Linear twins share the same tensors); only the
     # weights are freed. state_dict() of these Linears is dead from here on.
     for lin in (getattr(block, f"{stream}_attn_qkv"),
@@ -460,8 +464,11 @@ class MMDoubleStreamBlock(nn.Module):
         def _img_mlp_call(x):
             if _fp8_on:
                 h = self._fp8_img_mlp_up(x)
+                _down = self._fp8_img_mlp_down
+                if getattr(self, "_img_mlp_gelu_fused", False) and not _down._forward_hooks:
+                    return _down.forward_gelu_tanh(h)
                 h = self._img_mlp_act(h)
-                return self._fp8_img_mlp_down(h)
+                return _down(h)
             return self.img_mlp(x)
 
         def _txt_proj_call(x):
@@ -470,8 +477,11 @@ class MMDoubleStreamBlock(nn.Module):
         def _txt_mlp_call(x):
             if _fp8_txt_on:
                 h = self._fp8_txt_mlp_up(x)
+                _down = self._fp8_txt_mlp_down
+                if getattr(self, "_txt_mlp_gelu_fused", False) and not _down._forward_hooks:
+                    return _down.forward_gelu_tanh(h)
                 h = self._txt_mlp_act(h)
-                return self._fp8_txt_mlp_down(h)
+                return _down(h)
             return self.txt_mlp(x)
 
         def _txt_tail(txt_in):
