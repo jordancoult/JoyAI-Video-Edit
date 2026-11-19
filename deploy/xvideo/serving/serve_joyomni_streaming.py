@@ -1928,8 +1928,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                                 gate_state["full_body_reason"] = _full_reason
                                 gate_state["person_last"] = _full_reason is None
                             else:
-                                gate_state["person_last"] = _person_present(
-                                    frame, onnx_path=args.person_detector_onnx, conf=float(args.person_gate_conf))
+                                # ai-livestream patch: no YOLO body gate outside full-body detection
+                                gate_state["person_last"] = True
                         gate_state["person_check_i"] = (_tick + 1) % person_stride
                         _body_here = bool(gate_state["person_last"])
                         _face_here = bool(gate_state.get("face_last", True))
