@@ -266,6 +266,8 @@ class JoyOmniRuntime:
 
 
         dit = load_dit(cfg, device=device_obj)
+        from xvideo.models.runtime_lora import maybe_install as _ail_lora  # ai-livestream patch
+        dit = _ail_lora(dit)
         if getattr(dit.config, "causal", False):
             dit.config.use_inference_kv_cache = True
         dit.requires_grad_(False)
