@@ -86,11 +86,15 @@ if _FAST_ACCUM:
             tl.store(XQ + row * K + idx, q, mask=idx < K)
 
     def _fa_pick_config(M, N, K):
+        # (BM, BN, BK, warps, stages). Re-tuned on an RTX 5090 at the serving shapes (M = 347..1376); every pick
+        # gives bit-identical output to the original table (same K order, same 512-element fp16 promotion).
         if K >= 8192:  # mlp down projections
-            return (64, 256, 8, 3) if M >= 1000 else (64, 128, 8, 3)
-        if N >= 12288:  # attn qkv / mlp up
-            return (128, 256, 8, 3) if M >= 500 else (64, 256, 8, 3)
-        return (64, 256, 8, 3) if M >= 1800 else (64, 128, 8, 3)
+            return (64, 128, 256, 4, 3) if M >= 1000 else (64, 128, 128, 8, 3)
+        if N >= 16384:  # mlp up
+            return (128, 256, 128, 8, 3) if M >= 1000 else (128, 128, 128, 8, 3)
+        if N >= 12288:  # attn qkv
+            return (128, 128, 128, 8, 3) if M >= 1000 else (128, 256, 128, 8, 3)
+        return (64, 256, 128, 8, 3) if M >= 1800 else (64, 128, 128, 8, 3)
 
 
 def _quantize_weight_per_channel(w_bf16: torch.Tensor):
@@ -143,7 +147,7 @@ class Fp8Linear(nn.Module):
             N = self.out_features
             y = torch.empty((M, N), device=x_2d.device, dtype=self.out_dtype)
             xs_eff = x_scale.view(-1)
-            bm, bn, warps, stages = _fa_pick_config(M, N, K)
+            bm, bn, bk, warps, stages = _fa_pick_config(M, N, K)
             grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
             _fa_mm_kernel[grid](
                 x_q, self.weight_fp8, y, xs_eff, self.weight_scale,
@@ -153,7 +157,7 @@ class Fp8Linear(nn.Module):
                 self.weight_fp8.stride(0), self.weight_fp8.stride(1),
                 y.stride(0), y.stride(1),
                 HAS_BIAS=self.bias is not None,
-                BM=bm, BN=bn, BK=128, GROUP=8, PROMOTE=_FA_PROMOTE,
+                BM=bm, BN=bn, BK=bk, GROUP=8, PROMOTE=_FA_PROMOTE * 128 // bk,
                 num_warps=warps, num_stages=stages,
             )
             return y.reshape(*orig_shape[:-1], self.out_features)
