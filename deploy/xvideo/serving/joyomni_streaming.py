@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from pathlib import Path
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from PIL import Image
@@ -456,6 +457,37 @@ class JoyOmniRuntime:
             if session is not None:
                 session.close(timeout=warmup_timeout)
 
+
+# Dev-only kernel profiler (off unless set): JOYOMNI_TORCH_PROFILE="<first_chunk>:<n_chunks>:<out_prefix>"
+# profiles the DiT worker's denoise of chunks [first, first+n) and writes <out_prefix>.txt (kernel table) + .json (trace).
+_TORCH_PROFILE = os.environ.get("JOYOMNI_TORCH_PROFILE", "").strip()
+
+
+class _DitProfiler:
+    def __init__(self, spec: str):
+        first, n, self.out = spec.split(":", 2)
+        self.first, self.last = int(first), int(first) + int(n)
+        self.prof = None
+        self.done = False
+
+    def before(self, chunk_idx: int) -> None:
+        if self.done or self.prof is not None or chunk_idx != self.first:
+            return
+        self.prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+        self.prof.__enter__()
+
+    def after(self, chunk_idx: int) -> None:
+        if self.prof is None or chunk_idx + 1 < self.last:
+            return
+        torch.cuda.synchronize()
+        self.prof.__exit__(None, None, None)
+        table = self.prof.key_averages().table(sort_by="cuda_time_total", row_limit=60, max_name_column_width=90)
+        Path(self.out + ".txt").write_text(table)
+        self.prof.export_chrome_trace(self.out + ".json")
+        print(f"#####[PROFILE] chunks {self.first}..{self.last - 1} -> {self.out}.txt", flush=True)
+        self.prof, self.done = None, True
+
 class JoyOmniV2VStreamingSession:
     _session_serial_counter = 0
     def __init__(
@@ -541,6 +573,7 @@ class JoyOmniV2VStreamingSession:
         self._pseudo_latent: torch.Tensor | None = None
         self._pseudo_latent_ready_event: torch.cuda.Event | None = None
         self._encode_stream: torch.cuda.Stream | None = None
+        self._dit_profiler = _DitProfiler(_TORCH_PROFILE) if _TORCH_PROFILE else None
         self._decode_stream: torch.cuda.Stream | None = None
         self._pseudo_stream: torch.cuda.Stream | None = None
         self._post_stream: torch.cuda.Stream | None = None
@@ -1492,6 +1525,8 @@ class JoyOmniV2VStreamingSession:
                     )
                     with _dit_stream_ctx:
                         _consume_on_current_stream(encoded.ready_event, encoded.ref_chunk_latent)
+                        if self._dit_profiler is not None:
+                            self._dit_profiler.before(encoded.job.chunk_idx)
                         current_chunk_latents = self._denoise_chunk(
                             encoded.ref_chunk_latent,
                             profile=encoded.job.profile,
@@ -1504,6 +1539,8 @@ class JoyOmniV2VStreamingSession:
                             frozen_anchor_id=encoded.job.frozen_anchor_id,
                         )
                         _dit_ready = _record_ready_event()
+                        if self._dit_profiler is not None:
+                            self._dit_profiler.after(encoded.job.chunk_idx)
                 self._set_debug_state("dit-denoise", "put_decode_queue", encoded.job.chunk_idx)
                 self._queue_put(self._decode_queue,
                     _DenoisedChunk(job=encoded.job, current_chunk_latents=current_chunk_latents, ready_event=_dit_ready)
