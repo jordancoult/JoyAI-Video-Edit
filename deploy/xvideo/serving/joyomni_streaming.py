@@ -660,6 +660,21 @@ class JoyOmniV2VStreamingSession:
         self._raise_worker_error_if_needed()
         return results
 
+    def hold_frame(self, frame: Image.Image, frame_meta: dict[str, Any] | None = None) -> int:
+        """Backpressure (pipeline full): buffer the frame but keep only the newest frames_per_next_chunk - 1
+        pending, so nothing is submitted now and the next chunk starts with fresh frames the moment capacity
+        frees (instead of waiting for a whole new chunk of frames). Returns how many old frames were discarded."""
+        self._raise_worker_error_if_needed()
+        frame = self._resize_frame(frame)
+        meta = frame_meta or {"seq": self.chunk_idx + len(self.pending_frames) + 1, "t_capture_ms": time.time() * 1000.0}
+        self.pending_frames.append(frame)
+        self.pending_metas.append(meta)
+        drop = max(0, len(self.pending_frames) - (self.frames_per_next_chunk - 1))
+        if drop:
+            del self.pending_frames[:drop]
+            del self.pending_metas[:drop]
+        return drop
+
     @torch.no_grad()
     def flush_pending(self) -> None:
         self._raise_worker_error_if_needed()

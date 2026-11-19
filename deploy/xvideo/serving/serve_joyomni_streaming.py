@@ -964,6 +964,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
         pe_defer = False
         pe_task: asyncio.Task | None = None
         session_max_inflight = max(0, int(args.max_inflight_chunks or 0))
+        # ai-livestream: what camera input does while max_inflight_chunks are in flight: "hold" (keep the newest
+        # frames for the next chunk; +1.5-2 fps at 30 fps input, +0.17 s latency) or upstream's "drop" (default). Env JOYOMNI_BACKPRESSURE, start message "backpressure".
+        session_backpressure = os.environ.get("JOYOMNI_BACKPRESSURE", "drop")
 
         gate_state = {"count": 0, "cx": None, "cy": None, "absent": 0,
                       "absent_hold": False, "present": 0, "person_check_i": 0, "person_last": True,
@@ -1557,6 +1560,8 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         static_diff_thresh = float(
                             payload.get("static_diff_thresh", args.static_diff_thresh)
                         )
+                        session_backpressure = str(payload.get(
+                            "backpressure", os.environ.get("JOYOMNI_BACKPRESSURE", "drop")))
                         session_max_inflight = max(0, int(
                             payload.get("max_inflight_chunks", args.max_inflight_chunks) or 0
                         ))
@@ -2024,6 +2029,14 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                         )
                     try:
                         if not lossless_mode and session_max_inflight and session.inflight_chunks() >= session_max_inflight:
+                            if session_backpressure == "hold" and session.initialized:
+                                # ai-livestream: keep the newest frames for the next chunk instead of dropping
+                                _held_drop = session.hold_frame(frame, frame_meta=frame_meta)
+                                edit_frames += 1 - _held_drop
+                                ws_debug["frames_dropped_backpressure"] = (
+                                    int(ws_debug.get("frames_dropped_backpressure", 0)) + _held_drop
+                                )
+                                return []
                             ws_debug["frames_dropped_backpressure"] = (
                                 int(ws_debug.get("frames_dropped_backpressure", 0)) + 1
                             )
