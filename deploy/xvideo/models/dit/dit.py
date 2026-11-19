@@ -204,7 +204,11 @@ def _concat_kv_entries(
     device: torch.device,
     dtype: torch.dtype,
     cached_freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    tail_keys: Optional[list] = None,
+    tail_values: Optional[list] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    # tail_keys/tail_values (the current chunk's K/V) are appended in the same concat: one copy of the whole
+    # window per layer and step instead of two (cache concat, then cache + current). Same values, same order.
     keys = []
     values = []
     pre_rope_offset = 0
@@ -231,8 +235,13 @@ def _concat_kv_entries(
         keys.append(key)
         values.append(value)
 
+    if tail_keys:
+        keys.extend(tail_keys)
+        values.extend(tail_values)
     if not keys:
         return None, None
+    if len(keys) == 1:
+        return keys[0], values[0]
 
     return torch.cat(keys, dim=1), torch.cat(values, dim=1)
 
@@ -398,12 +407,10 @@ class MMDoubleStreamBlock(nn.Module):
 
         if skip_text_stream:
             q = img_q
-            k = img_k
-            v = img_v
+            k_parts, v_parts = [img_k], [img_v]
         else:
             q = torch.cat((img_q, txt_q), dim=1)
-            k = torch.cat((img_k, txt_k), dim=1)
-            v = torch.cat((img_v, txt_v), dim=1)
+            k_parts, v_parts = [img_k, txt_k], [img_v, txt_v]
 
         if kv_cache_writer is not None:
             kv_cache_writer(layer_idx, img_k_for_cache, img_v)
@@ -416,18 +423,29 @@ class MMDoubleStreamBlock(nn.Module):
                 cached_freqs_cis=cached_freqs_cis if kv_cache_pre_rope else None,
             )
         elif kv_cache_reader is not None:
-            cached_key, cached_value = _concat_kv_entries(
+            # cache window + current chunk in a single concat (ai-livestream speed patch)
+            cached_key = cached_value = None
+            k, v = _concat_kv_entries(
                 kv_cache_reader(layer_idx),
                 device=q.device,
                 dtype=q.dtype,
                 cached_freqs_cis=cached_freqs_cis if kv_cache_pre_rope else None,
+                tail_keys=k_parts,
+                tail_values=v_parts,
             )
+            k_parts = v_parts = None
         else:
             cached_key = cached_value = None
 
-        if cached_key is not None:
-            k = torch.cat([cached_key, k], dim=1)
-            v = torch.cat([cached_value, v], dim=1)
+        if k_parts is not None:
+            if cached_key is not None:
+                k = torch.cat([cached_key, *k_parts], dim=1)
+                v = torch.cat([cached_value, *v_parts], dim=1)
+            elif len(k_parts) == 1:
+                k, v = k_parts[0], v_parts[0]
+            else:
+                k = torch.cat(k_parts, dim=1)
+                v = torch.cat(v_parts, dim=1)
 
         attn = _flash_attention4(q, k, v)
         attn = attn.flatten(2, 3)
